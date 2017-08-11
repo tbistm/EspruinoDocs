@@ -72,26 +72,41 @@ function doConnect() {
 
 var at;
 var busy = false;
+
+
+/* socks may have the following states:
+undefined		: unused
+true				:	connected and ready
+Wait				:	waiting for connection (client), or for data to be sent
+tobeclosed	:	closed (either locally or remotly or both)
+							but not yet closed and available because of data still in the pipe.
+*/
 var socks = [];
+
+/*
+each socket has its string buffer
+where remote data are written (receipt of data from the modem)
+and from where the local upper layer take the data
+*/
 var sockData = ["","","","","","","","","","","",""];
 var MAXSOCKETS = 12;
 
-
+/* physical turn on & reset pins */
 var rst;
 var rst_active_level;
 var pwrkey;
 var pwrkey_active_level;
 var flowcontrol = false;
 
-// Geolocaliation variables
-// longitude,latitude
+/* Geolocaliation variables :  longitude,latitude */
 var longlat = "";
-// State of the feature (running or not)
+/* Geolocaliation state (running or not) */
 var geoPos = false;
 
 // by default, without setting, debug in the module is disabled
 var dbg = false;
 
+/* modem may have the following initialization states */
 var AtInitSequence = {
 	AT_SYNCHRO: 0,
 	AT_RSP_FORMAT: 1,
@@ -106,17 +121,28 @@ var AtInitSequence = {
 	AT_HW_FLOW_CONTROL: 10,
 };
 
+/*
+Closesocket is run because of 2 triggers :
+- either from a local trigger (http layer on the target)
+- or from a remote trigger (host on network)
 
+Closing is done for active socket which are not sending
+-	check socket exists, verify the socket state is not "undefined"
+- closing cannot bypass sending
+
+Closing is possible if the AT media is free
+- check if a AT communication is on-going
+
+At the end, socket is either closed (successful) or waiting to be closed.
+In this last case, either a new closing is initiated (remote if first attemps was local, local if first attemps was remote)
+or triggered from this module when data buffer is emptied
+- Mark this socket as tobeclosed, will be closed when data buffer emptied
+*/
 function closeSocket(socket) {
-
-	// check socket exists
-	// verify the socket state is not "undefined"
 	if(socks[socket]) {
-		// closing cannot bypass sending
 		if (busy) {
 			if (dbg) console.log("at register currenly programmed");
 			setTimeout(function cb(){console.log("closing later..."); closeSocket(socket);}, 1500);
-			// check if a AT communication is on-going
 		} else if (at.isBusy()){
 				if (dbg) console.log("AT busy");
 				setTimeout(function cb(){console.log("closing again..."); closeSocket(socket);}, 1500);
@@ -129,7 +155,7 @@ function closeSocket(socket) {
 						socks[socket] = undefined;
 					} else {
 						if (dbg) console.log("cannot close socket now" + socket +",error=" + d);
-						// Mark this socket as tobeclosed, will be closed when data buffer emptied
+
 						socks[socket] = "tobeclosed";
 					}
 				});
@@ -139,6 +165,9 @@ function closeSocket(socket) {
 	}
 }
 
+/*
+abortWaiting frees the registering (preventive)
+*/
 function abortWaitingPrompt() {
 	console.log("Abort waiting prompt (for sending data)");
 	busy = false;
@@ -265,8 +294,6 @@ var netCallbacks = {
   },
   /* Send data. Returns the number of bytes sent - 0 is ok.
   Less than 0  */
-  /* Send data. Returns the number of bytes sent - 0 is ok.
-  Less than 0  */
   send: function(sckt, data) {
     if (busy || at.isBusy() || socks[sckt]=="Wait") return 0;
     if (socks[sckt]=="tobeclosed") return -1; // request closing
@@ -329,28 +356,25 @@ var netCallbacks = {
   }
 };
 
-//Handle +QUIRC incoming data from modem previously configured in direct push mode
-// typical expected format : +QIURC:"recv",<connectID>,<currentrecvlength><CR><LF><data>
-
-// Several cases :
-
-// case 1 : receipt of something where end of line is missing
-// like
 /*
+Handle +QUIRC incoming data from modem previously configured in direct push mode
+
+Typical expected format : +QIURC:"recv",<connectID>,<currentrecvlength><CR><LF><data>
+
+ Several cases :
+ - case 1 : receipt of something where end of line is missing
 +QIURC: "recv"
-*/
 
-
-// case 2 : receipt of something where line is smaller than expected
-// like
-/*
+- case 2 : receipt of something where line is smaller than expected
 +QIURC: "recv",0,259\r\nHTTP/1.1 "
-*/
 
-// case 3 : receipt of something where line is greater than expected
-// like
-/*
+- case 3 : receipt of something where line is greater than expected
 +QIURC: "recv",0,263\r\ndata\r\n+QIURC: "closed",0\r\n
+
+
+Processing :
+First search for <CR><LF> index in the line to locate the end of first message
+
 */
 function receiveHandler(line) {
   /*if (dbg) console.log("receiveHandler line in:");
@@ -358,8 +382,6 @@ function receiveHandler(line) {
   if (dbg) console.log("line.length :");
   if (dbg) console.log(line.length);*/
 
-  // there should be <CR><LF> both before and after URC
-  // search for <CR><LF> index to locate the end of first line
   // colon equal -1 when end of line is missing (case 1)
   var colon = line.indexOf("\r\n");
   // if (dbg) console.log("colon :" + colon);
@@ -433,24 +455,38 @@ function receiveHandler2(line) {
   }
 }
 
+/*
+When TCP socket service is closed by remote peer or network error, this function is entered
+
+Typical expected format : +QIURC: "recv",<connectID><CR><LF>
+
+First search for <CR><LF> index in the line to locate the end
+Note <CR> is enough (no need to wait for <LF>) : this will immediatly closes the socket
+
+2 options
+- Not enough data may not have been received at this moment so that line is simply returned.
+- Enough data may finally be received then search for the <connectID>
+<connectID> is the socket index to close.
+
+Note the trick to convert string into integer with this instruction :
+parms[1] = 0|parms[1];
+*/
 function closehandler(line) {
   if (dbg) console.log("closehandler:" + line);
 
   var colon = line.indexOf("\r\n");
- // no <CR><LF> or line too short
+
   if (colon<0) {
 		if (dbg) console.log("not enough data " + line);
 
-		// let'see if enough data are received
-		// this will immediatly closes the socket
 		var colon = line.indexOf("\r");
 		if (colon<0) {
 			if (dbg) console.log("definitively not enough data " + line);
-			return line; // not enough data here at the moment
+			return line;
 		}
   }
   var parms = line.substring(0,colon).split(",");
-  // trick is to converted string into integer
+
   parms[1] = 0|parms[1];
 
   closeSocket(parms[1]);
@@ -469,78 +505,70 @@ function pdpdeacthandler(line) {
   });
 }
 
-// Manage QIND URC
+// Manage QIND URC,  dust
 // it could be
 //	+QIND: SMS DONE SMS initialization finished
 //  +QIND: PB DONE Phonebook initialization finished
+// 1st option : dust the line (selected in the code)
+//
+// 2nd option : dust only this message (to have in mind)
+	//var colon = line.indexOf("\r\n");
+	//var endstr = line.substr(colon,line.length);
+	//console.log(line.substr(colon,line.length));
+	// re_inject other commands
+	//return endstr;
 function QindHandler(line) {
 	if (dbg) console.log('QindHandler in: ' + line);
 
-	//var colon = line.indexOf("\r\n");
-	//var endstr = line.substr(colon,line.length);
-
-	//console.log(line.substr(colon,line.length));
-	// Dust the line
-	//return line;
 	return "";
-
-	// re_inject other commands
-	//return endstr;
 }
 
-// Manage QSIM URC
+// Manage QSIM URC, dust
 // it could be
 //	+QUSIM: 0 Use SIM card
 //  +QUSIM: 1 Use USIM card
+// 1st option : dust the line (selected in the code)
+//
+// 2nd option : dust only this message (to have in mind)
+	//var colon = line.indexOf("\r\n");
+	//var endstr = line.substr(colon,line.length);
+	//console.log(line.substr(colon,line.length));
+	// re_inject other commands
+	//return endstr;
 function QusimHandler(line) {
 	if (dbg) console.log('QusimHandler in: ' + line);
 
-	//var colon = line.indexOf("\r\n");
-	//var endstr = line.substr(colon,line.length);
-
-
-	//console.log(line.substr(colon,line.length));
-	// Dust the line, and any other URCs
-	//return line;
 	return "";
-
-	// re_inject other commands
-	//return endstr;
-
 }
 
-// Manage CFUN URC
+// Manage CFUN URC, dust
+// 1st option : dust the line (selected in the code)
+//
+// 2nd option : dust only this message (to have in mind)
+	//var colon = line.indexOf("\r\n");
+	//var endstr = line.substr(colon,line.length);
+	//console.log(line.substr(colon,line.length));
+	// re_inject other commands
+	//return endstr;
 function CfunHandler(line) {
 	if (dbg) console.log('CfunHandler in: ' + line);
 
-	//var colon = line.indexOf("\r\n");
-	//var endstr = line.substr(colon,line.length);
-
-	//if (dbg) console.log(line.substr(colon,line.length));
-	// Dust the line
-	//return line;
 	return "";
-
-	// re_inject other commands
-	//return endstr;
-
 }
 
-
+// Manage CFUN URC, dust
+// It means : "ME initialization is successful"
+// 1st option : dust the line (selected in the code)
+//
+// 2nd option : dust only this message (to have in mind)
+	//var colon = line.indexOf("\r\n");
+	//var endstr = line.substr(colon,line.length);
+	//console.log(line.substr(colon,line.length));
+	// re_inject other commands
 function RdyHandler(line) {
 	if (dbg) console.log('RdyHandler in: ' + line);
 
-	//var colon = line.indexOf("\r\n");
-	//var endstr = line.substr(colon,line.length);
-
-	//if (dbg) console.log(line.substr(colon,line.length));
-	// Dust the line
-	//return line;
 	return "";
-
-	// re_inject other commands
-	//return endstr;
-
 }
 
 var gprsFuncs = {
@@ -829,8 +857,6 @@ var gprsFuncs = {
 
       }
     };
-    //at.cmd("ATE0\r\n",1000,cb);
-	//at.cmd("AT\r\n",1000,cb);
 	/* repeat AT SYNC: Send AT every 500ms, if receive OK, SYNC success, if no OK return after sending AT 10 times, SYNC fail */
 	setTimeout(function(){at.cmd('AT\r\n', 1000, cb);},500);
   },
@@ -992,6 +1018,24 @@ resetOptions = {
  pwrkey_active_level: 1,
 };
 
+/*
+This is the 'exported' (named function)
+it can be used with :
+require('UG96.js').connect(Serial, resetOptions, function(err) { console.log("connecting..."); });
+
+This sets the pins to turn on, reset the module.
+This loads the submodules required to work with.
+
+This manages QIURC (Quectel Incoming Unsolicited Result Code)
+- URC of Incoming Data
+- URC of Connection Closed
+- URC of PDP Deactivation
+
+This Manage URC (Unsolicited Result Code) with no conditional triggers
+(UGxx AT Commands Manual, Table 12: Summary of URC )
+
+this reset the modem
+*/
 exports.connect = function(usart, resetOptions, connectedCallback) {
   resetOptions = resetOptions || {};
   rst = resetOptions.rst || undefined;
@@ -1002,22 +1046,15 @@ exports.connect = function(usart, resetOptions, connectedCallback) {
   gprsFuncs.at = at = require('AT').connect(usart);
   require("NetworkJS").create(netCallbacks);
 
-  /* Manage Data */
-  // QIURC may also contains the reports about connection closed, incoming connection
   at.register("+QIURC: \"recv\"", receiveHandler);
   at.register("+D", receiveHandler2);
   at.register("+QIURC: \"closed\"", closehandler);
   at.register("+QIURC: \"pdpdeact\"", pdpdeacthandler);
 
-  /* Manage URC (Unsolicited Result Code) having no triggers */
-  /* AT Commands Manual */
-  /* Table 12: Summary of URC */
   at.register("+QIND:", QindHandler);
   at.register("+QUSIM:", QusimHandler);
   at.register("+CFUN:", CfunHandler);
   at.register("RDY", RdyHandler);
-
-  //gprsFuncs.debug(true, false);
 
   gprsFuncs.reset(connectedCallback);
   return gprsFuncs;
